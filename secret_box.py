@@ -12,13 +12,18 @@ from cryptography.fernet import Fernet
 @dataclass(slots=True)
 class SecretBox:
     key_path: Path
+    persist_to_disk: bool = True
     _fernet: Fernet | None = None
 
     def __post_init__(self) -> None:
-        self.key_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.key_path.exists():
-            self.key_path.write_bytes(Fernet.generate_key())
-        self._fernet = Fernet(self.key_path.read_bytes())
+        if self.persist_to_disk:
+            self.key_path.parent.mkdir(parents=True, exist_ok=True)
+            if not self.key_path.exists():
+                self.key_path.write_bytes(Fernet.generate_key())
+            key = self.key_path.read_bytes()
+        else:
+            key = Fernet.generate_key()
+        self._fernet = Fernet(key)
 
     def encrypt(self, text: str) -> str:
         return self._fernet.encrypt(text.encode("utf-8")).decode("utf-8")

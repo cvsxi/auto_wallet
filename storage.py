@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -212,8 +213,21 @@ def classify_category(amount_minor: int, mcc: int | None, description: str) -> s
 class JsonStorage:
     path: Path
     secret_box: SecretBox
+    persist_to_disk: bool = True
+    _memory_payload: dict[str, Any] | None = None
 
     def load(self) -> dict[str, Any]:
+        if not self.persist_to_disk:
+            if self._memory_payload is None:
+                return {
+                    "updated_at": None,
+                    "client": {},
+                    "accounts": [],
+                    "transactions": [],
+                    "stats": {},
+                }
+            return copy.deepcopy(self._memory_payload)
+
         if not self.path.exists():
             return {
                 "updated_at": None,
@@ -418,6 +432,10 @@ class JsonStorage:
         return payload
 
     def _write_payload(self, payload: dict[str, Any]) -> None:
+        if not self.persist_to_disk:
+            self._memory_payload = copy.deepcopy(payload)
+            return
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("w", encoding="utf-8") as file:
             json.dump(

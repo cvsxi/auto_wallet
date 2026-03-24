@@ -40,6 +40,8 @@ class MonobankTelegramBot:
     _offset: int | None = None
     _monitor_thread: threading.Thread | None = None
     _clients: dict[int, MonobankClient] = field(default_factory=dict)
+    _storages: dict[int, JsonStorage] = field(default_factory=dict)
+    _state_cache: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     def run(self) -> None:
         self.telegram.delete_webhook(drop_pending_updates=False)
@@ -212,6 +214,8 @@ class MonobankTelegramBot:
 
         self.registry.remove(chat_id, delete_files=True)
         self._clients.pop(chat_id, None)
+        self._storages.pop(chat_id, None)
+        self._state_cache.pop(chat_id, None)
         self._safe_send(chat_id, "Підключення видалено. Token і локальні дані цього чату очищені.")
 
     def _handle_status(self, chat_id: int) -> None:
@@ -338,6 +342,8 @@ class MonobankTelegramBot:
             "`+ 1200 зарплата`\n"
             "`- 250 їжа`"
         )
+        if self.settings.privacy_strict_mode:
+            text += "\n\nPrivacy mode: токени та історія не зберігаються на диску. Після рестарту бота потрібно підключитися знову."
         self._safe_send(chat_id, text)
 
     def _handle_transaction_exclusion(
@@ -518,9 +524,22 @@ class MonobankTelegramBot:
         ]
 
     def _storage_for(self, chat_id: int) -> JsonStorage:
-        return JsonStorage(self.registry.data_file(chat_id), self.registry.secret_box)
+        storage = self._storages.get(chat_id)
+        if storage is not None:
+            return storage
+
+        storage = JsonStorage(
+            self.registry.data_file(chat_id),
+            self.registry.secret_box,
+            persist_to_disk=not self.settings.privacy_strict_mode,
+        )
+        self._storages[chat_id] = storage
+        return storage
 
     def _load_state(self, profile: UserProfile) -> dict[str, Any]:
+        if self.settings.privacy_strict_mode:
+            return dict(self._state_cache.get(profile.chat_id, self._default_state()))
+
         path = self.registry.state_file(profile.chat_id)
         if not path.exists():
             return self._default_state()
@@ -538,6 +557,10 @@ class MonobankTelegramBot:
         raise ValueError("Unsupported state format.")
 
     def _save_state(self, profile: UserProfile, payload: dict[str, Any]) -> None:
+        if self.settings.privacy_strict_mode:
+            self._state_cache[profile.chat_id] = dict(payload)
+            return
+
         path = self.registry.state_file(profile.chat_id)
         with path.open("w", encoding="utf-8") as file:
             json.dump(
@@ -788,7 +811,11 @@ def main() -> None:
         registry=UserRegistry(
             settings.registry_file,
             settings.users_dir,
-            SecretBox(settings.secrets_key_file),
+            SecretBox(
+                settings.secrets_key_file,
+                persist_to_disk=not settings.privacy_strict_mode,
+            ),
+            persist_to_disk=not settings.privacy_strict_mode,
         ),
     )
     bot.run()

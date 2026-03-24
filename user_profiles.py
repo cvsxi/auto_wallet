@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 from dataclasses import asdict, dataclass
@@ -49,6 +50,8 @@ class UserRegistry:
     path: Path
     users_dir: Path
     secret_box: SecretBox
+    persist_to_disk: bool = True
+    _memory_raw: dict[str, Any] | None = None
 
     def list_profiles(self) -> list[UserProfile]:
         raw = self._load_raw()
@@ -94,6 +97,11 @@ class UserRegistry:
             shutil.rmtree(directory)
 
     def _load_raw(self) -> dict[str, Any]:
+        if not self.persist_to_disk:
+            if self._memory_raw is None:
+                self._memory_raw = {"users": {}}
+            return copy.deepcopy(self._memory_raw)
+
         if not self.path.exists():
             return {"users": {}}
 
@@ -110,6 +118,10 @@ class UserRegistry:
         raise ValueError("Unsupported registry format.")
 
     def _save_raw(self, payload: dict[str, Any]) -> None:
+        if not self.persist_to_disk:
+            self._memory_raw = copy.deepcopy(payload)
+            return
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("w", encoding="utf-8") as file:
             json.dump(self.secret_box.encrypt_json(payload), file, ensure_ascii=False, separators=(",", ":"))
