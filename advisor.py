@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import BytesIO
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -135,168 +136,6 @@ def build_daily_analysis_text(
     return "\n".join(lines)
 
 
-def build_daily_analysis_payload(
-    transactions: list[dict],
-    timezone_name: str,
-    target_date: date | None = None,
-) -> dict:
-    zone = _safe_zone(timezone_name)
-    now_local = datetime.now(zone)
-    day = target_date or now_local.date()
-    today_transactions = _transactions_for_local_day(transactions, day, zone)
-    prev_days = [day - timedelta(days=index) for index in range(1, 8)]
-
-    by_currency: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"income_minor": 0, "expense_minor": 0, "count": 0}
-    )
-    by_category: dict[str, int] = defaultdict(int)
-    top_operations: list[dict] = []
-    holds = 0
-
-    for item in today_transactions:
-        amount_minor = int(item["amount_minor"])
-        currency = str(item["currency"])
-        currency_entry = by_currency[currency]
-        if amount_minor >= 0:
-            currency_entry["income_minor"] += amount_minor
-        else:
-            expense_minor = abs(amount_minor)
-            currency_entry["expense_minor"] += expense_minor
-            by_category[str(item["category"])] += expense_minor
-        if item.get("hold"):
-            holds += 1
-        currency_entry["count"] += 1
-
-        top_operations.append(
-            {
-                "datetime": str(item["datetime"])[:19],
-                "category": str(item["category"]),
-                "currency": currency,
-                "amount": round(amount_minor / 100, 2),
-                "direction": "income" if amount_minor >= 0 else "expense",
-                "hold": bool(item.get("hold")),
-            }
-        )
-
-    top_operations = sorted(
-        top_operations,
-        key=lambda item: abs(float(item["amount"])),
-        reverse=True,
-    )[:5]
-
-    weekly_expense_avg_by_currency: dict[str, float] = {}
-    for currency in by_currency:
-        totals: list[int] = []
-        for prev_day in prev_days:
-            total = 0
-            for item in transactions:
-                if _local_date(item, zone) != prev_day:
-                    continue
-                if str(item["currency"]) != currency:
-                    continue
-                amount_minor = int(item["amount_minor"])
-                if amount_minor < 0:
-                    total += abs(amount_minor)
-            if total:
-                totals.append(total)
-        weekly_expense_avg_by_currency[currency] = round((sum(totals) / len(totals)) / 100, 2) if totals else 0.0
-
-    return {
-        "date": day.isoformat(),
-        "timezone": timezone_name,
-        "transactions_count": len(today_transactions),
-        "hold_transactions_count": holds,
-        "by_currency": {
-            currency: {
-                "income": round(values["income_minor"] / 100, 2),
-                "expense": round(values["expense_minor"] / 100, 2),
-                "net": round((values["income_minor"] - values["expense_minor"]) / 100, 2),
-                "count": values["count"],
-                "avg_daily_expense_last_7_days": weekly_expense_avg_by_currency.get(currency, 0.0),
-            }
-            for currency, values in sorted(by_currency.items())
-        },
-        "top_expense_categories": [
-            {"category": category, "expense": round(amount_minor / 100, 2)}
-            for category, amount_minor in sorted(
-                by_category.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )[:5]
-        ],
-        "largest_operations": top_operations,
-    }
-
-
-def build_period_analysis_payload(
-    transactions: list[dict],
-    timezone_name: str,
-    label: str,
-) -> dict:
-    by_currency: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"income_minor": 0, "expense_minor": 0, "count": 0}
-    )
-    by_category: dict[str, int] = defaultdict(int)
-    top_operations: list[dict] = []
-    holds = 0
-
-    for item in transactions:
-        amount_minor = int(item["amount_minor"])
-        currency = str(item["currency"])
-        currency_entry = by_currency[currency]
-        if amount_minor >= 0:
-            currency_entry["income_minor"] += amount_minor
-        else:
-            expense_minor = abs(amount_minor)
-            currency_entry["expense_minor"] += expense_minor
-            by_category[str(item["category"])] += expense_minor
-        if item.get("hold"):
-            holds += 1
-        currency_entry["count"] += 1
-
-        top_operations.append(
-            {
-                "datetime": str(item["datetime"])[:19],
-                "category": str(item["category"]),
-                "currency": currency,
-                "amount": round(amount_minor / 100, 2),
-                "direction": "income" if amount_minor >= 0 else "expense",
-                "hold": bool(item.get("hold")),
-            }
-        )
-
-    top_operations = sorted(
-        top_operations,
-        key=lambda item: abs(float(item["amount"])),
-        reverse=True,
-    )[:7]
-
-    return {
-        "period": label,
-        "timezone": timezone_name,
-        "transactions_count": len(transactions),
-        "hold_transactions_count": holds,
-        "by_currency": {
-            currency: {
-                "income": round(values["income_minor"] / 100, 2),
-                "expense": round(values["expense_minor"] / 100, 2),
-                "net": round((values["income_minor"] - values["expense_minor"]) / 100, 2),
-                "count": values["count"],
-            }
-            for currency, values in sorted(by_currency.items())
-        },
-        "top_expense_categories": [
-            {"category": category, "expense": round(amount_minor / 100, 2)}
-            for category, amount_minor in sorted(
-                by_category.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )[:7]
-        ],
-        "largest_operations": top_operations,
-    }
-
-
 def build_daily_digest_text(
     transactions: list[dict],
     timezone_name: str,
@@ -316,41 +155,7 @@ def build_month_comparison_text(
     zone = _safe_zone(timezone_name)
     today_local = datetime.now(zone).date()
     anchor_day = target_date or today_local
-    current_month_start = anchor_day.replace(day=1)
-    month_starts = [
-        _shift_month(current_month_start, offset)
-        for offset in range(-(months_back - 1), 1)
-    ]
-
-    monthly_rows: list[dict[str, object]] = []
-    for month_start in month_starts:
-        month_transactions = _transactions_for_local_month(transactions, month_start, zone)
-        income_minor = 0
-        expense_minor = 0
-        by_category: dict[str, int] = defaultdict(int)
-        for item in month_transactions:
-            amount_minor = int(item["amount_minor"])
-            if amount_minor >= 0:
-                income_minor += amount_minor
-            else:
-                expense_minor += abs(amount_minor)
-                by_category[str(item["category"])] += abs(amount_minor)
-
-        monthly_rows.append(
-            {
-                "month_start": month_start,
-                "label": month_start.strftime("%Y-%m"),
-                "income_minor": income_minor,
-                "expense_minor": expense_minor,
-                "net_minor": income_minor - expense_minor,
-                "count": len(month_transactions),
-                "top_categories": sorted(
-                    by_category.items(),
-                    key=lambda item: item[1],
-                    reverse=True,
-                )[:3],
-            }
-        )
+    monthly_rows = _build_monthly_rows(transactions, zone, anchor_day, months_back)
 
     current = monthly_rows[-1]
     previous = monthly_rows[-2] if len(monthly_rows) > 1 else None
@@ -438,6 +243,93 @@ def build_month_comparison_text(
     return "\n".join(lines)
 
 
+def build_month_comparison_chart(
+    transactions: list[dict],
+    timezone_name: str,
+    target_date: date | None = None,
+    months_back: int = 6,
+) -> bytes:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+
+    zone = _safe_zone(timezone_name)
+    today_local = datetime.now(zone).date()
+    anchor_day = target_date or today_local
+    monthly_rows = _build_monthly_rows(transactions, zone, anchor_day, months_back)
+
+    labels = [str(row["label"]) for row in monthly_rows]
+    incomes = [int(row["income_minor"]) / 100 for row in monthly_rows]
+    expenses = [int(row["expense_minor"]) / 100 for row in monthly_rows]
+    positions = list(range(len(labels)))
+    bar_width = 0.36
+
+    figure, axis = plt.subplots(figsize=(10, 5), dpi=160)
+    figure.patch.set_facecolor("#f7f4ee")
+    axis.set_facecolor("#fffdf8")
+
+    axis.bar(
+        [position - bar_width / 2 for position in positions],
+        expenses,
+        width=bar_width,
+        color="#d9534f",
+        label="Витрати",
+    )
+    axis.bar(
+        [position + bar_width / 2 for position in positions],
+        incomes,
+        width=bar_width,
+        color="#2e8b57",
+        label="Доходи",
+    )
+
+    axis.set_title(
+        f"Порівняння місяців станом на {anchor_day.isoformat()}",
+        fontsize=14,
+        fontweight="bold",
+    )
+    axis.set_ylabel("Сума")
+    axis.set_xticks(positions, labels)
+    axis.grid(axis="y", alpha=0.25, linestyle="--")
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.legend(frameon=False)
+
+    peak = max(incomes + expenses) if (incomes or expenses) else 0
+    if peak > 0:
+        axis.set_ylim(0, peak * 1.2)
+
+    for position, value in zip(positions, expenses):
+        if value > 0:
+            axis.text(
+                position - bar_width / 2,
+                value,
+                f"{value:.0f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#7a2e2b",
+            )
+    for position, value in zip(positions, incomes):
+        if value > 0:
+            axis.text(
+                position + bar_width / 2,
+                value,
+                f"{value:.0f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#1f5f3d",
+            )
+
+    buffer = BytesIO()
+    figure.tight_layout()
+    figure.savefig(buffer, format="png", bbox_inches="tight")
+    plt.close(figure)
+    return buffer.getvalue()
+
+
 def _transactions_for_local_day(
     transactions: list[dict],
     day: date,
@@ -457,6 +349,50 @@ def _transactions_for_local_month(
         if _local_date(item, zone).year == month_start.year
         and _local_date(item, zone).month == month_start.month
     ]
+
+
+def _build_monthly_rows(
+    transactions: list[dict],
+    zone: tzinfo,
+    anchor_day: date,
+    months_back: int,
+) -> list[dict[str, object]]:
+    current_month_start = anchor_day.replace(day=1)
+    month_starts = [
+        _shift_month(current_month_start, offset)
+        for offset in range(-(months_back - 1), 1)
+    ]
+
+    monthly_rows: list[dict[str, object]] = []
+    for month_start in month_starts:
+        month_transactions = _transactions_for_local_month(transactions, month_start, zone)
+        income_minor = 0
+        expense_minor = 0
+        by_category: dict[str, int] = defaultdict(int)
+        for item in month_transactions:
+            amount_minor = int(item["amount_minor"])
+            if amount_minor >= 0:
+                income_minor += amount_minor
+            else:
+                expense_minor += abs(amount_minor)
+                by_category[str(item["category"])] += abs(amount_minor)
+
+        monthly_rows.append(
+            {
+                "month_start": month_start,
+                "label": month_start.strftime("%Y-%m"),
+                "income_minor": income_minor,
+                "expense_minor": expense_minor,
+                "net_minor": income_minor - expense_minor,
+                "count": len(month_transactions),
+                "top_categories": sorted(
+                    by_category.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:3],
+            }
+        )
+    return monthly_rows
 
 
 def _shift_month(base: date, offset: int) -> date:

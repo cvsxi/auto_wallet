@@ -32,11 +32,7 @@ class Settings:
     registry_file: Path
     users_dir: Path
     secrets_key_file: Path
-    privacy_strict_mode: bool = True
-    gemini_api_key: str | None = None
-    gemini_models: tuple[str, ...] = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
-    gemini_usage_file: Path | None = None
-    gemini_switch_after_requests: int = 19
+    privacy_strict_mode: bool = False
     poll_timeout_seconds: int = 30
     default_sync_days: int = 30
     default_timezone: str = "Europe/Kyiv"
@@ -50,23 +46,12 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        privacy_strict_mode = _read_bool("PRIVACY_STRICT_MODE", default=True)
+        privacy_strict_mode = _read_bool("PRIVACY_STRICT_MODE", default=False)
         default_sync_days = int(os.getenv("DEFAULT_SYNC_DAYS", "30").strip())
         default_timezone = os.getenv("DEFAULT_TIMEZONE", "Europe/Kyiv").strip() or "Europe/Kyiv"
         daily_analysis_hour = int(os.getenv("DAILY_ANALYSIS_HOUR", "23").strip())
         monitor_lookback = int(os.getenv("MONITOR_INITIAL_LOOKBACK_MINUTES", "30").strip())
         monitor_secondary_every = int(os.getenv("MONITOR_SECONDARY_EVERY_CYCLES", "5").strip())
-        gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        gemini_models_raw = os.getenv(
-            "GEMINI_MODELS",
-            "gemini-2.5-flash,gemini-2.5-flash-lite",
-        ).strip()
-        gemini_models = tuple(
-            model.strip()
-            for model in gemini_models_raw.split(",")
-            if model.strip()
-        ) or ("gemini-2.5-flash",)
-        gemini_switch_after_requests = int(os.getenv("GEMINI_SWITCH_AFTER_REQUESTS", "19").strip())
 
         if not telegram_bot_token:
             raise ValueError("Не задано TELEGRAM_BOT_TOKEN у .env або змінних середовища.")
@@ -80,10 +65,6 @@ class Settings:
             users_dir=USERS_DIR,
             secrets_key_file=DATA_DIR / ".secret.key",
             privacy_strict_mode=privacy_strict_mode,
-            gemini_api_key=gemini_api_key or None,
-            gemini_models=gemini_models,
-            gemini_usage_file=DATA_DIR / "gemini_usage.json",
-            gemini_switch_after_requests=max(1, min(19, gemini_switch_after_requests)),
             poll_timeout_seconds=30,
             default_sync_days=max(1, default_sync_days),
             default_timezone=default_timezone,

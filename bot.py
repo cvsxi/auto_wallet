@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from advisor import (
     build_daily_digest_text,
-    build_daily_analysis_text,
+    build_month_comparison_chart,
     build_month_comparison_text,
 )
 from config import Settings
@@ -41,6 +41,36 @@ class MonobankTelegramBot:
     _clients: dict[int, MonobankClient] = field(default_factory=dict)
     _storages: dict[int, JsonStorage] = field(default_factory=dict)
     _state_cache: dict[int, dict[str, Any]] = field(default_factory=dict)
+    _pending_connect_chats: set[int] = field(default_factory=set)
+    _menu_contexts: dict[int, str] = field(default_factory=dict)
+    _menu_actions: dict[str, str] = field(
+        default_factory=lambda: {
+            "Підключити": "/connect",
+            "Почати": "/start",
+            "Статус": "/status",
+            "Аналіз": "/analysis_menu",
+            "Звіти": "/report_menu",
+            "Операції": "/operations_menu",
+            "Сповіщення": "/notifications",
+            "Миттєво": "/notifications instant",
+            "Щоденний звіт": "/notifications daily",
+            "Вимкнути повідомлення": "/notifications off",
+            "Звіт за сьогодні": "/report today",
+            "Звіт за тиждень": "/report week",
+            "Звіт за місяць": "/report month",
+            "Звіт за весь час": "/report all",
+            "Аналіз за сьогодні": "/analysis today",
+            "Аналіз за тиждень": "/analysis week",
+            "Аналіз за місяць": "/analysis month",
+            "Аналіз за весь час": "/analysis all",
+            "Операції за сьогодні": "/operations today",
+            "Операції за тиждень": "/operations week",
+            "Операції за місяць": "/operations month",
+            "Усі операції": "/operations all",
+            "Назад": "/back",
+            "Відключити": "/disconnect",
+        }
+    )
 
     def run(self) -> None:
         self.telegram.delete_webhook(drop_pending_updates=False)
@@ -85,11 +115,17 @@ class MonobankTelegramBot:
         text = str(message.get("text", "")).strip()
         if not text:
             return
+        text = self._menu_actions.get(text, text)
 
         try:
             if text.startswith("/"):
                 command, args = self._parse_command(text)
                 self._handle_command(chat_id, command, args, message)
+                return
+
+            if chat_id in self._pending_connect_chats:
+                self._connect_user(chat_id, text, message)
+                self._pending_connect_chats.discard(chat_id)
                 return
 
             if self._looks_like_monobank_token(text):
@@ -141,15 +177,24 @@ class MonobankTelegramBot:
         message: dict[str, Any],
     ) -> None:
         if command in {"start", "help"}:
+            self._set_menu_context(chat_id, "main")
             self._send_help(chat_id)
+            return
+        if command == "back":
+            self._set_menu_context(chat_id, "main")
+            self._safe_send(chat_id, "Головне меню.")
             return
         if command == "connect":
             if not args:
-                self._safe_send(chat_id, "Надішліть `/connect <monobank_token>` або просто сам token одним повідомленням.")
+                self._pending_connect_chats.add(chat_id)
+                self._safe_send(chat_id, "Надішліть одним наступним повідомленням ваш Monobank token.")
                 return
+            self._pending_connect_chats.discard(chat_id)
             self._connect_user(chat_id, args[0], message)
             return
         if command == "disconnect":
+            self._pending_connect_chats.discard(chat_id)
+            self._set_menu_context(chat_id, "main")
             self._disconnect_user(chat_id)
             return
         if command == "status":
@@ -162,12 +207,25 @@ class MonobankTelegramBot:
             return
 
         if command == "report":
+            self._set_menu_context(chat_id, "report")
             self._handle_report(chat_id, profile, args, mode="summary")
+        elif command == "report_menu":
+            self._set_menu_context(chat_id, "report")
+            self._safe_send(chat_id, "Оберіть період звіту.")
         elif command == "analysis":
+            self._set_menu_context(chat_id, "analysis")
             self._handle_analysis(chat_id, profile, args)
+        elif command == "analysis_menu":
+            self._set_menu_context(chat_id, "analysis")
+            self._safe_send(chat_id, "Оберіть період аналізу.")
         elif command == "operations":
+            self._set_menu_context(chat_id, "operations")
             self._handle_report(chat_id, profile, args, mode="operations")
+        elif command == "operations_menu":
+            self._set_menu_context(chat_id, "operations")
+            self._safe_send(chat_id, "Оберіть період для списку операцій.")
         elif command in {"notifications", "notify"}:
+            self._set_menu_context(chat_id, "notifications")
             self._handle_notifications(chat_id, profile, args)
         elif command in {"exclude", "delete"}:
             self._handle_transaction_exclusion(chat_id, profile, args, excluded=True)
@@ -178,8 +236,8 @@ class MonobankTelegramBot:
 
     def _connect_user(self, chat_id: int, token: str, message: dict[str, Any]) -> None:
         token = token.strip()
-        if not self._looks_like_monobank_token(token):
-            raise ValueError("Схоже, це не Monobank token.")
+        if not token:
+            raise ValueError("Надішліть непорожній Monobank token.")
 
         existing_profile = self.registry.get(chat_id)
         preserve_existing_data = existing_profile is not None and existing_profile.monobank_token == token
@@ -208,6 +266,7 @@ class MonobankTelegramBot:
         storage.save_accounts(client_info)
         if not preserve_existing_data:
             self._save_state(profile, self._default_state())
+        self._pending_connect_chats.discard(chat_id)
 
         self._safe_send(
             chat_id,
@@ -224,6 +283,7 @@ class MonobankTelegramBot:
         self._clients.pop(chat_id, None)
         self._storages.pop(chat_id, None)
         self._state_cache.pop(chat_id, None)
+        self._menu_contexts.pop(chat_id, None)
         self._safe_send(chat_id, "Підключення видалено. Token і локальні дані цього чату очищені.")
 
     def _handle_status(self, chat_id: int) -> None:
@@ -296,9 +356,11 @@ class MonobankTelegramBot:
         state = self._load_state(profile)
         if not args or args == ["today"]:
             self._send_long_message(chat_id, self._cached_daily_digest(profile, state))
+            self._send_month_comparison_chart(chat_id, profile)
             return
         if len(args) == 1 and args[0].lower() == "month":
             self._send_long_message(chat_id, self._cached_monthly_report(profile, state))
+            self._send_month_comparison_chart(chat_id, profile)
             return
 
         effective_args = args
@@ -319,7 +381,7 @@ class MonobankTelegramBot:
                 self._safe_send(chat_id, f"Немає операцій для аналізу за період: {date_range.label}.")
             return
 
-        text = self._build_period_analysis_message(profile, active_transactions, date_range.label)
+        text = build_summary_text(active_transactions, date_range.label)
         self._send_long_message(chat_id, text)
 
     def _send_help(self, chat_id: int) -> None:
@@ -379,12 +441,13 @@ class MonobankTelegramBot:
         state = self._load_state(profile)
         if not args:
             mode = self._notification_mode(state)
-            self._safe_send(
+            self.telegram.send_message(
                 chat_id,
                 (
                     f"Поточний режим сповіщень: {mode}\n"
-                    "Доступно: /notifications instant, /notifications daily, /notifications off"
+                    "Оберіть кнопкою, коли бот має надсилати повідомлення."
                 ),
+                reply_markup=self._notifications_menu_markup(),
             )
             return
 
@@ -658,6 +721,7 @@ class MonobankTelegramBot:
 
         digest = self._cached_daily_digest(profile, state)
         self._send_long_message(profile.chat_id, digest)
+        self._send_month_comparison_chart(profile.chat_id, profile)
         state["last_auto_report_date"] = today.isoformat()
         self._save_state(profile, state)
 
@@ -849,28 +913,120 @@ class MonobankTelegramBot:
         elif not user_state_file.exists():
             self._save_state(profile, self._default_state())
 
-    def _build_daily_analysis_message(
-        self,
-        profile: UserProfile,
-        transactions: list[dict[str, Any]],
-        report_date,
-    ) -> str:
-        return build_daily_analysis_text(transactions, profile.timezone, report_date)
+    def _send_month_comparison_chart(self, chat_id: int, profile: UserProfile) -> None:
+        snapshot = self._storage_for(profile.chat_id).load()
+        active_transactions = self._balance_transactions(snapshot.get("transactions", []))
+        if not active_transactions:
+            return
 
-    def _build_period_analysis_message(
-        self,
-        profile: UserProfile,
-        transactions: list[dict[str, Any]],
-        label: str,
-    ) -> str:
-        return build_summary_text(transactions, label)
+        image_bytes = build_month_comparison_chart(
+            active_transactions,
+            profile.timezone,
+            self._local_today(profile),
+        )
+        self.telegram.send_photo(
+            chat_id,
+            image_bytes,
+            filename="month-comparison.png",
+            caption="Графік доходів і витрат по місяцях",
+        )
+
+    def _menu_markup(self, chat_id: int) -> dict[str, Any]:
+        if self.registry.get(chat_id) is None:
+            keyboard = [
+                ["Підключити", "Почати"],
+                ["Статус"],
+            ]
+            placeholder = "Оберіть команду або надішліть token"
+        else:
+            context = self._menu_contexts.get(chat_id, "main")
+            if context == "report":
+                return self._report_menu_markup()
+            if context == "analysis":
+                return self._analysis_menu_markup()
+            if context == "operations":
+                return self._operations_menu_markup()
+            if context == "notifications":
+                return self._notifications_menu_markup()
+            keyboard = [
+                ["Статус", "Аналіз"],
+                ["Звіти", "Операції"],
+                ["Сповіщення", "Підключити"],
+                ["Відключити"],
+            ]
+            placeholder = "Оберіть команду або введіть транзакцію"
+        return {
+            "keyboard": keyboard,
+            "resize_keyboard": True,
+            "is_persistent": True,
+            "input_field_placeholder": placeholder,
+        }
+
+    def _set_menu_context(self, chat_id: int, context: str) -> None:
+        self._menu_contexts[chat_id] = context
+
+    @staticmethod
+    def _notifications_menu_markup() -> dict[str, Any]:
+        return {
+            "keyboard": [
+                ["Миттєво", "Щоденний звіт"],
+                ["Вимкнути повідомлення"],
+                ["Назад"],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+            "input_field_placeholder": "Оберіть режим сповіщень",
+        }
+
+    @staticmethod
+    def _report_menu_markup() -> dict[str, Any]:
+        return {
+            "keyboard": [
+                ["Звіт за сьогодні", "Звіт за тиждень"],
+                ["Звіт за місяць", "Звіт за весь час"],
+                ["Назад"],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+            "input_field_placeholder": "Оберіть період звіту",
+        }
+
+    @staticmethod
+    def _analysis_menu_markup() -> dict[str, Any]:
+        return {
+            "keyboard": [
+                ["Аналіз за сьогодні", "Аналіз за тиждень"],
+                ["Аналіз за місяць", "Аналіз за весь час"],
+                ["Назад"],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+            "input_field_placeholder": "Оберіть період аналізу",
+        }
+
+    @staticmethod
+    def _operations_menu_markup() -> dict[str, Any]:
+        return {
+            "keyboard": [
+                ["Операції за сьогодні", "Операції за тиждень"],
+                ["Операції за місяць", "Усі операції"],
+                ["Назад"],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+            "input_field_placeholder": "Оберіть період операцій",
+        }
 
     def _send_long_message(self, chat_id: int, text: str) -> None:
         for chunk in chunk_text(text):
             self._safe_send(chat_id, chunk)
 
     def _safe_send(self, chat_id: int, text: str) -> None:
-        self.telegram.send_message(chat_id, text[:4096])
+        self.telegram.send_message(
+            chat_id,
+            text[:4096],
+            reply_markup=self._menu_markup(chat_id),
+        )
 
     @staticmethod
     def _sleep_seconds(seconds: int) -> None:
@@ -919,7 +1075,12 @@ class MonobankTelegramBot:
 
     @staticmethod
     def _looks_like_monobank_token(text: str) -> bool:
-        return text.startswith("ud_") and " " not in text and len(text) >= 20
+        normalized = text.strip()
+        if not normalized or " " in normalized:
+            return False
+        if normalized.startswith(("+", "-", "/")):
+            return False
+        return len(normalized) >= 20
 
 
 def main() -> None:
