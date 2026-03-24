@@ -344,6 +344,7 @@ class JsonStorage:
         self,
         amount_minor: int,
         category: str,
+        description: str,
         account_id: str | None = None,
     ) -> dict[str, Any]:
         snapshot = self.load()
@@ -363,7 +364,7 @@ class JsonStorage:
                     "id": transaction_id,
                     "account_id": account_id,
                     "time": timestamp,
-                    "description": "Додано вручну",
+                    "description": description.strip() or "Без назви",
                     "comment": None,
                     "counterName": None,
                     "mcc": None,

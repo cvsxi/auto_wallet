@@ -297,12 +297,207 @@ def build_period_analysis_payload(
     }
 
 
+def build_daily_digest_text(
+    transactions: list[dict],
+    timezone_name: str,
+    target_date: date | None = None,
+) -> str:
+    day_text = build_daily_analysis_text(transactions, timezone_name, target_date)
+    month_text = build_month_comparison_text(transactions, timezone_name, target_date)
+    return f"{day_text}\n\n{month_text}"
+
+
+def build_month_comparison_text(
+    transactions: list[dict],
+    timezone_name: str,
+    target_date: date | None = None,
+    months_back: int = 6,
+) -> str:
+    zone = _safe_zone(timezone_name)
+    today_local = datetime.now(zone).date()
+    anchor_day = target_date or today_local
+    current_month_start = anchor_day.replace(day=1)
+    month_starts = [
+        _shift_month(current_month_start, offset)
+        for offset in range(-(months_back - 1), 1)
+    ]
+
+    monthly_rows: list[dict[str, object]] = []
+    for month_start in month_starts:
+        month_transactions = _transactions_for_local_month(transactions, month_start, zone)
+        income_minor = 0
+        expense_minor = 0
+        by_category: dict[str, int] = defaultdict(int)
+        for item in month_transactions:
+            amount_minor = int(item["amount_minor"])
+            if amount_minor >= 0:
+                income_minor += amount_minor
+            else:
+                expense_minor += abs(amount_minor)
+                by_category[str(item["category"])] += abs(amount_minor)
+
+        monthly_rows.append(
+            {
+                "month_start": month_start,
+                "label": month_start.strftime("%Y-%m"),
+                "income_minor": income_minor,
+                "expense_minor": expense_minor,
+                "net_minor": income_minor - expense_minor,
+                "count": len(month_transactions),
+                "top_categories": sorted(
+                    by_category.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:3],
+            }
+        )
+
+    current = monthly_rows[-1]
+    previous = monthly_rows[-2] if len(monthly_rows) > 1 else None
+    previous_expenses = [int(item["expense_minor"]) for item in monthly_rows[:-1] if int(item["expense_minor"]) > 0]
+    previous_incomes = [int(item["income_minor"]) for item in monthly_rows[:-1] if int(item["income_minor"]) > 0]
+
+    expense_delta_prev = (
+        _percent_delta(int(current["expense_minor"]), int(previous["expense_minor"]))
+        if previous is not None
+        else None
+    )
+    income_delta_prev = (
+        _percent_delta(int(current["income_minor"]), int(previous["income_minor"]))
+        if previous is not None
+        else None
+    )
+
+    avg_previous_expense = round(sum(previous_expenses) / len(previous_expenses)) if previous_expenses else 0
+    avg_previous_income = round(sum(previous_incomes) / len(previous_incomes)) if previous_incomes else 0
+
+    advice: list[str] = []
+    if expense_delta_prev is not None:
+        if expense_delta_prev >= 15:
+            advice.append("Витрати вищі за минулий місяць, варто переглянути найбільші категорії.")
+        elif expense_delta_prev <= -10:
+            advice.append("Витрати нижчі за минулий місяць, поточний темп виглядає кращим.")
+    if income_delta_prev is not None:
+        if income_delta_prev >= 10:
+            advice.append("Доходи ростуть відносно минулого місяця.")
+        elif income_delta_prev <= -10:
+            advice.append("Доходи просіли відносно минулого місяця, тримайте запас ліквідності.")
+    if avg_previous_expense and int(current["expense_minor"]) > avg_previous_expense * 1.2:
+        advice.append("Поточні витрати помітно вищі за середні по попередніх місяцях.")
+    if avg_previous_income and int(current["income_minor"]) < avg_previous_income * 0.85:
+        advice.append("Поточні доходи нижчі за середні по попередніх місяцях.")
+    if not advice:
+        advice.append("Місяць рухається без різких відхилень від попередньої динаміки.")
+
+    top_category_lines = [
+        f"- {category}: {_money(amount_minor)}"
+        for category, amount_minor in current["top_categories"]  # type: ignore[index]
+    ] or ["- Немає витрат за поточний місяць."]
+
+    expense_chart = _build_month_chart(monthly_rows, "expense_minor", "Витрати")
+    income_chart = _build_month_chart(monthly_rows, "income_minor", "Доходи")
+
+    lines = [
+        f"Порівняння місяців станом на {anchor_day.isoformat()}",
+        f"Поточний місяць: {current['label']}",
+        f"- Доходи: {_money(int(current['income_minor']))}",
+        f"- Витрати: {_money(int(current['expense_minor']))}",
+        f"- Баланс: {_money(int(current['net_minor']))}",
+        f"- Операцій: {int(current['count'])}",
+    ]
+    if previous is not None:
+        lines.extend(
+            [
+                "",
+                "Порівняння з минулим місяцем:",
+                f"- Доходи: {_format_delta(income_delta_prev)}",
+                f"- Витрати: {_format_delta(expense_delta_prev)}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "Тренди:",
+            f"- Середні доходи за попередні місяці: {_money(avg_previous_income)}",
+            f"- Середні витрати за попередні місяці: {_money(avg_previous_expense)}",
+            "",
+            "Найбільші категорії витрат поточного місяця:",
+            *top_category_lines,
+            "",
+            expense_chart,
+            "",
+            income_chart,
+            "",
+            "Висновки:",
+        ]
+    )
+    for item in advice[:4]:
+        lines.append(f"- {item}")
+
+    return "\n".join(lines)
+
+
 def _transactions_for_local_day(
     transactions: list[dict],
     day: date,
     zone: tzinfo,
 ) -> list[dict]:
     return [item for item in transactions if _local_date(item, zone) == day]
+
+
+def _transactions_for_local_month(
+    transactions: list[dict],
+    month_start: date,
+    zone: tzinfo,
+) -> list[dict]:
+    return [
+        item
+        for item in transactions
+        if _local_date(item, zone).year == month_start.year
+        and _local_date(item, zone).month == month_start.month
+    ]
+
+
+def _shift_month(base: date, offset: int) -> date:
+    month_index = (base.year * 12 + (base.month - 1)) + offset
+    year, month_zero = divmod(month_index, 12)
+    return date(year, month_zero + 1, 1)
+
+
+def _build_month_chart(
+    rows: list[dict[str, object]],
+    key: str,
+    label: str,
+) -> str:
+    values = [int(row[key]) for row in rows]
+    max_value = max(values) if any(values) else 0
+    chart_lines = [f"{label} по місяцях:"]
+    for row in rows:
+        value = int(row[key])
+        bar = _bar(value, max_value)
+        chart_lines.append(f"- {row['label']}: {bar} {_money(value)}")
+    return "\n".join(chart_lines)
+
+
+def _bar(value: int, max_value: int, width: int = 12) -> str:
+    if max_value <= 0 or value <= 0:
+        return "░" * width
+    filled = max(1, round((value / max_value) * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _percent_delta(current: int, previous: int) -> int | None:
+    if previous == 0:
+        return None
+    return round(((current - previous) / previous) * 100)
+
+
+def _format_delta(delta: int | None) -> str:
+    if delta is None:
+        return "немає бази для порівняння"
+    sign = "+" if delta >= 0 else ""
+    return f"{sign}{delta}%"
 
 
 def _local_date(transaction: dict, zone: tzinfo) -> date:
