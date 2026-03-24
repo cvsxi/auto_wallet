@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+
+data/
+
+.venv/
+__pycache__/
+*.py[cod]
+
+bot_stdout.log
+bot_stderr.log
+*.log
+
+.idea/
+.vscode/
