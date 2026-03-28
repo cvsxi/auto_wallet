@@ -32,6 +32,8 @@ class Settings:
     registry_file: Path
     users_dir: Path
     secrets_key_file: Path
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-2.5-flash"
     privacy_strict_mode: bool = False
     poll_timeout_seconds: int = 30
     default_sync_days: int = 30
@@ -46,6 +48,8 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip() or None
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
         privacy_strict_mode = _read_bool("PRIVACY_STRICT_MODE", default=False)
         default_sync_days = int(os.getenv("DEFAULT_SYNC_DAYS", "30").strip())
         default_timezone = os.getenv("DEFAULT_TIMEZONE", "Europe/Kyiv").strip() or "Europe/Kyiv"
@@ -64,6 +68,8 @@ class Settings:
             registry_file=DATA_DIR / "user_profiles.json",
             users_dir=USERS_DIR,
             secrets_key_file=DATA_DIR / ".secret.key",
+            gemini_api_key=gemini_api_key,
+            gemini_model=gemini_model,
             privacy_strict_mode=privacy_strict_mode,
             poll_timeout_seconds=30,
             default_sync_days=max(1, default_sync_days),

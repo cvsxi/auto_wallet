@@ -16,6 +16,7 @@ from advisor import (
     build_month_comparison_text,
 )
 from config import Settings
+from gemini_advisor import GeminiAnalysisError, GeminiAdvisor
 from monobank_client import MonobankAPIError, MonobankClient
 from reporting import (
     ReportArgumentError,
@@ -93,10 +94,17 @@ class MonobankTelegramBot:
 
         print("Telegram bot started. Waiting for updates...")
         while True:
-            updates = self.telegram.get_updates(
-                offset=self._offset,
-                timeout=self.settings.poll_timeout_seconds,
-            )
+            try:
+                updates = self.telegram.get_updates(
+                    offset=self._offset,
+                    timeout=self.settings.poll_timeout_seconds,
+                )
+            except TelegramAPIError as exc:
+                if self._is_polling_conflict(exc):
+                    print("Telegram polling conflict detected. Retrying in 5 seconds...")
+                    self._sleep_seconds(5)
+                    continue
+                raise
             for update in updates:
                 self._offset = int(update["update_id"]) + 1
                 self._handle_update(update)
@@ -304,7 +312,9 @@ class MonobankTelegramBot:
             f"- виключено з балансу: {snapshot.get('stats', {}).get('excluded_transactions_count', 0)}",
             f"- перевірено рахунків: {len(state.get('last_checked_by_account', {}))}",
             f"- сповіщення: {self._notification_mode(state)}",
-            f"- аналіз: локальний через /analysis ({profile.timezone})",
+            f"- аналіз: /analysis + Gemini ({profile.timezone})"
+            if self.settings.gemini_api_key
+            else f"- аналіз: локальний через /analysis ({profile.timezone})",
         ]
         self._safe_send(chat_id, "\n".join(lines))
 
@@ -338,6 +348,8 @@ class MonobankTelegramBot:
             else:
                 text = build_summary_text(active_transactions, date_range.label)
         else:
+            state = self._load_state(profile)
+            self._remember_operations_view(profile, state, filtered, date_range.label)
             text = build_operations_text(filtered, date_range.label)
         self._send_long_message(chat_id, text)
 
@@ -355,11 +367,41 @@ class MonobankTelegramBot:
 
         state = self._load_state(profile)
         if not args or args == ["today"]:
-            self._send_long_message(chat_id, self._cached_daily_digest(profile, state))
+            today = self._local_today(profile)
+            local_text = self._cached_daily_digest(profile, state)
+            active_transactions = self._transactions_for_local_day(
+                self._balance_transactions(transactions),
+                profile,
+                today,
+            )
+            self._send_long_message(
+                chat_id,
+                self._compose_analysis_text(
+                    profile,
+                    active_transactions,
+                    f"{today.isoformat()} (локальний день)",
+                    local_text,
+                ),
+            )
             self._send_month_comparison_chart(chat_id, profile)
             return
         if len(args) == 1 and args[0].lower() == "month":
-            self._send_long_message(chat_id, self._cached_monthly_report(profile, state))
+            today = self._local_today(profile)
+            local_text = self._cached_monthly_report(profile, state)
+            active_transactions = self._transactions_for_local_month(
+                self._balance_transactions(transactions),
+                profile,
+                today.replace(day=1),
+            )
+            self._send_long_message(
+                chat_id,
+                self._compose_analysis_text(
+                    profile,
+                    active_transactions,
+                    f"{today.strftime('%Y-%m')} (локальний місяць)",
+                    local_text,
+                ),
+            )
             self._send_month_comparison_chart(chat_id, profile)
             return
 
@@ -381,8 +423,100 @@ class MonobankTelegramBot:
                 self._safe_send(chat_id, f"Немає операцій для аналізу за період: {date_range.label}.")
             return
 
-        text = build_summary_text(active_transactions, date_range.label)
+        base_text = build_summary_text(active_transactions, date_range.label)
+        text = self._compose_analysis_text(
+            profile,
+            active_transactions,
+            date_range.label,
+            base_text,
+        )
         self._send_long_message(chat_id, text)
+
+    def _compose_analysis_text(
+        self,
+        profile: UserProfile,
+        transactions: list[dict[str, Any]],
+        label: str,
+        base_text: str,
+    ) -> str:
+        gemini_text = self._generate_gemini_analysis(profile, transactions, label)
+        if not gemini_text:
+            return base_text
+        return f"{base_text}\n\nGemini:\n{gemini_text}"
+
+    def _generate_gemini_analysis(
+        self,
+        profile: UserProfile,
+        transactions: list[dict[str, Any]],
+        label: str,
+    ) -> str | None:
+        if not transactions or not self.settings.gemini_api_key:
+            return None
+
+        advisor = GeminiAdvisor(
+            api_key=self.settings.gemini_api_key,
+            model_name=self.settings.gemini_model,
+        )
+        try:
+            return advisor.analyze_period(
+                transactions=transactions,
+                timezone_name=profile.timezone,
+                label=label,
+            )
+        except GeminiAnalysisError as exc:
+            print("Gemini analysis error:", exc)
+            return f"Gemini тимчасово недоступний: {exc}"
+
+    def _remember_operations_view(
+        self,
+        profile: UserProfile,
+        state: dict[str, Any],
+        transactions: list[dict[str, Any]],
+        label: str,
+    ) -> None:
+        visible_transactions = list(reversed(transactions))
+        state["last_operations_label"] = label
+        state["last_operations_lookup"] = [str(item["id"]) for item in visible_transactions]
+        state["last_operations_updated_at"] = utc_now_iso()
+        self._save_state(profile, state)
+
+    def _resolve_transaction_reference(
+        self,
+        state: dict[str, Any],
+        reference: str,
+    ) -> tuple[str, int | None]:
+        normalized = reference.strip().lstrip("#№")
+        if normalized.isdigit():
+            lookup = state.get("last_operations_lookup", [])
+            number = int(normalized)
+            if 1 <= number <= len(lookup):
+                return str(lookup[number - 1]), number
+        return reference.strip(), None
+
+    def _transactions_for_local_day(
+        self,
+        transactions: list[dict[str, Any]],
+        profile: UserProfile,
+        day: date,
+    ) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in transactions
+            if self._transaction_local_datetime(item, profile).date() == day
+        ]
+
+    def _transactions_for_local_month(
+        self,
+        transactions: list[dict[str, Any]],
+        profile: UserProfile,
+        month_start: date,
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for item in transactions:
+            local_dt = self._transaction_local_datetime(item, profile)
+            if local_dt.year == month_start.year and local_dt.month == month_start.month:
+                result.append(item)
+        return result
 
     def _send_help(self, chat_id: int) -> None:
         profile = self.registry.get(chat_id)
@@ -399,8 +533,8 @@ class MonobankTelegramBot:
                 "/report [today|week|month|all|YYYY-MM-DD YYYY-MM-DD]\n"
                 "/analysis [today|week|month|all|YYYY-MM-DD YYYY-MM-DD]\n"
                 "/operations [today|week|month|all|YYYY-MM-DD YYYY-MM-DD]\n"
-                "/exclude <transaction_id> [примітка]\n"
-                "/include <transaction_id>\n"
+                "/exclude <номер зі списку> [примітка]\n"
+                "/include <номер зі списку>\n"
                 "/disconnect"
             )
         else:
@@ -411,8 +545,8 @@ class MonobankTelegramBot:
                 "/report [today|week|month|all|YYYY-MM-DD YYYY-MM-DD]\n"
                 "/analysis [today|week|month|all|YYYY-MM-DD YYYY-MM-DD]\n"
                 "/operations [today|week|month|all|YYYY-MM-DD YYYY-MM-DD]\n"
-                "/exclude <transaction_id> [примітка]\n"
-                "/include <transaction_id>\n"
+                "/exclude <номер зі списку> [примітка]\n"
+                "/include <номер зі списку>\n"
                 "/disconnect\n\n"
                 "Щоб транзакція лишилася в історії, але не впливала на баланс, використовуйте /exclude."
             )
@@ -486,11 +620,12 @@ class MonobankTelegramBot:
         excluded: bool,
     ) -> None:
         if not args:
-            command = "/exclude <transaction_id> [примітка]" if excluded else "/include <transaction_id>"
+            command = "/exclude <номер зі списку> [примітка]" if excluded else "/include <номер зі списку>"
             self._safe_send(chat_id, f"Використання: {command}")
             return
 
-        transaction_id = args[0]
+        state = self._load_state(profile)
+        transaction_id, visible_number = self._resolve_transaction_reference(state, args[0])
         note = " ".join(args[1:]).strip() if excluded else None
         storage = self._storage_for(profile.chat_id)
         snapshot = storage.set_transaction_excluded(transaction_id, excluded=excluded, note=note)
@@ -508,8 +643,9 @@ class MonobankTelegramBot:
         action_text = "виключена з балансу" if excluded else "повернута в баланс"
         amount_minor = int(transaction["amount_minor"])
         sign = "+" if amount_minor >= 0 else "-"
+        reference_text = f"Операцію №{visible_number}" if visible_number is not None else "Операцію"
         lines = [
-            f"Транзакцію {transaction_id} {action_text}.",
+            f"{reference_text} {action_text}.",
             f"{transaction['datetime'][:19]} | {transaction['category']}",
             f"{sign}{abs(amount_minor) / 100:.2f} {transaction['currency']}",
             transaction["description"] or "Без опису",
@@ -655,6 +791,21 @@ class MonobankTelegramBot:
             zone = datetime.now().astimezone().tzinfo or UTC
         return datetime.now(zone).date()
 
+    def _transaction_local_datetime(
+        self,
+        transaction: dict[str, Any],
+        profile: UserProfile,
+    ) -> datetime:
+        try:
+            zone = ZoneInfo(profile.timezone)
+        except ZoneInfoNotFoundError:
+            zone = datetime.now().astimezone().tzinfo or UTC
+
+        dt = datetime.fromisoformat(str(transaction["datetime"]))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(zone)
+
     def _cached_daily_digest(
         self,
         profile: UserProfile,
@@ -789,6 +940,9 @@ class MonobankTelegramBot:
             "last_checked_by_account": {},
             "notified_transaction_ids": [],
             "notification_mode": "instant",
+            "last_operations_label": None,
+            "last_operations_lookup": [],
+            "last_operations_updated_at": None,
             "cached_daily_digest_date": None,
             "cached_daily_digest_text": None,
             "cached_monthly_report_date": None,
@@ -1031,6 +1185,11 @@ class MonobankTelegramBot:
     @staticmethod
     def _sleep_seconds(seconds: int) -> None:
         threading.Event().wait(seconds)
+
+    @staticmethod
+    def _is_polling_conflict(exc: TelegramAPIError) -> bool:
+        message = str(exc)
+        return "Telegram API error 409" in message or '"error_code":409' in message
 
     @staticmethod
     def _parse_command(text: str) -> tuple[str, list[str]]:

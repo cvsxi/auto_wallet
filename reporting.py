@@ -135,18 +135,23 @@ def build_operations_text(transactions: list[dict], label: str) -> str:
     lines = [
         f"Операції за період: {label}",
         f"Всього: {len(transactions)}, виключено з балансу: {excluded_count}",
+        "Щоб виключити або повернути операцію, використовуйте номер зі списку: /exclude <номер> або /include <номер>.",
+        "",
     ]
-    for item in reversed(transactions):
+    for index, item in enumerate(reversed(transactions), start=1):
         amount_minor = int(item["amount_minor"])
         sign = "+" if amount_minor >= 0 else "-"
         status = " [виключено]" if item.get("excluded_from_balance") else ""
         note = f" | примітка: {item['exclusion_note']}" if item.get("exclusion_note") else ""
-        lines.append(
-            f"- id={item['id']} | {item['datetime'][:19]} | {item['category']}{status} | "
-            f"{sign}{_money(abs(amount_minor))} {item['currency']} | "
-            f"{item['description'] or 'Без опису'}{note}"
+        lines.extend(
+            [
+                f"{index}. {item['datetime'][:19]} | {item['category']}{status}",
+                f"   {sign}{_money(abs(amount_minor))} {item['currency']}",
+                f"   {item['description'] or 'Без опису'}{note}",
+                "",
+            ]
         )
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
 
 def chunk_text(text: str, limit: int = 4000) -> list[str]:
